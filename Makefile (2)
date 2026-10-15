@@ -1,0 +1,68 @@
+/* client.c — клиент сервера выражений. СРС 1, задание 2, вариант 8.
+ * Использование: ./client "выражение" ["выражение" ...]
+ * Код завершения: 0 — все выражения вычислены, 1 — была ошибка в выражении,
+ *                 2 — системная ошибка (нет сервера и т. п.). */
+#define _POSIX_C_SOURCE 200809L
+#include "common.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static char my_fifo[64];
+static void cleanup(void) { unlink(my_fifo); }
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2) { fprintf(stderr, "Использование: %s \"выражение\" ...\n", argv[0]); return 2; }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    snprintf(my_fifo, sizeof my_fifo, CLIENT_FIFO_FMT, (int)getpid());
+    umask(0);
+    if (mkfifo(my_fifo, 0622) == -1) { perror("mkfifo client"); return 2; }
+    if (atexit(cleanup) != 0) { fprintf(stderr, "atexit failed\n"); unlink(my_fifo); return 2; }
+
+    int sfd = open(SERVER_FIFO, O_WRONLY | O_NONBLOCK);  /* сразу ошибка, если сервера нет */
+    if (sfd == -1) {
+        fprintf(stderr, "[client %d] сервер недоступен (%s): %s\n", (int)getpid(), SERVER_FIFO, strerror(errno));
+        return 2;
+    }
+    int fl = fcntl(sfd, F_GETFL);                       /* дальше — обычная блокирующая запись */
+    if (fl == -1 || fcntl(sfd, F_SETFL, fl & ~O_NONBLOCK) == -1) { perror("fcntl"); return 2; }
+
+    /* Свой FIFO открываем один раз на всё время работы. O_NONBLOCK — чтобы open
+     * на чтение не ждал писателя; собственный дескриптор на запись гарантирует,
+     * что read() не вернёт EOF, когда обработчик закроет свой конец. Без этого
+     * при повторном open() можно «поймать» ещё не закрытый конец прошлого
+     * обработчика и сразу получить EOF. */
+    int cfd = open(my_fifo, O_RDONLY | O_NONBLOCK);
+    if (cfd == -1) { perror("open client fifo (r)"); return 2; }
+    int keep = open(my_fifo, O_WRONLY);
+    if (keep == -1) { perror("open client fifo (w)"); return 2; }
+    fl = fcntl(cfd, F_GETFL);
+    if (fl == -1 || fcntl(cfd, F_SETFL, fl & ~O_NONBLOCK) == -1) { perror("fcntl"); return 2; }
+
+    int rc = 0;
+    for (int i = 1; i < argc; i++) {
+        struct request rq;
+        memset(&rq, 0, sizeof rq);
+        rq.client_pid = getpid();
+        if (strlen(argv[i]) >= EXPR_MAX) { fprintf(stderr, "выражение слишком длинное\n"); rc = 1; continue; }
+        strcpy(rq.expr, argv[i]);
+
+        if (write(sfd, &rq, sizeof rq) != (ssize_t)sizeof rq) { perror("write request"); return 2; }
+
+        struct answer an;
+        ssize_t n = read(cfd, &an, sizeof an);
+        if (n != (ssize_t)sizeof an) { fprintf(stderr, "[client %d] неполный ответ\n", (int)getpid()); return 2; }
+
+        printf("[client %d] %s   (обработал PID=%d)\n", (int)getpid(), an.text, (int)an.worker_pid);
+        if (!an.ok) rc = 1;
+    }
+    if (close(sfd) == -1 || close(cfd) == -1 || close(keep) == -1) perror("close");
+    return rc;
+}

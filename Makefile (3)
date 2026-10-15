@@ -1,0 +1,18 @@
+CC      = gcc
+CFLAGS  = -Wall -Wextra -std=c11 -pthread -O2
+
+all: server client
+
+server: server.c calc.c common.h calc.h
+	$(CC) $(CFLAGS) -o $@ server.c calc.c
+
+client: client.c common.h
+	$(CC) $(CFLAGS) -o $@ client.c
+
+run: all
+	./demo.sh
+
+clean:
+	rm -f server client /tmp/srs8_*.fifo
+
+.PHONY: all run clean
